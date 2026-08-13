@@ -160,6 +160,12 @@ Keep it out.
 
 ## Known limitations
 
+* **Tool calls come from `output` items.** Open WebUI's outlet filter never receives
+  `tool_calls` or `role: "tool"` messages — `outlet_filter_handler` rebuilds every
+  message from a fixed whitelist (id, role, content, info, timestamp, output, usage,
+  sources). Tool activity survives only as `function_call` / `function_call_output`
+  items inside the assistant message's `output`, which is what this pipeline parses.
+  The OpenAI-shaped pairing is kept as a fallback for callers that do send it.
 * **Tool observation timing.** Open WebUI runs tools between `inlet` and `outlet` and
   does not report when each one started, and the v4 SDK's `start_observation()` takes no
   explicit `start_time`. Tool and retriever observations are therefore reconstructed at

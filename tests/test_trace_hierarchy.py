@@ -127,6 +127,65 @@ def outlet_body(with_tools=False, with_sources=False):
     }
 
 
+def outlet_body_real_shape():
+    """The body Open WebUI actually hands to a pipeline outlet filter.
+
+    `outlet_filter_handler` in utils/middleware.py rebuilds every message from a fixed
+    whitelist -- id, role, content, info, timestamp, output, usage, sources. There is
+    no `tool_calls` key and no `role: "tool"` message; tool activity survives only as
+    `function_call` / `function_call_output` items inside the assistant's `output`.
+    Shape and values are taken from a real self-hosted Langfuse trace.
+    """
+    return {
+        "id": MESSAGE_ID,
+        "chat_id": CHAT_ID,
+        "session_id": "sess-1",
+        "model": "gemma4-E4B",
+        "messages": [
+            {
+                "id": "um-1",
+                "role": "user",
+                "content": "What day it is after 5 days",
+                "timestamp": 1786628481,
+            },
+            {
+                "id": MESSAGE_ID,
+                "role": "assistant",
+                "content": "Five days from now, it will be **August 18, 2026**.",
+                "timestamp": 1786628490,
+                "usage": {"prompt_tokens": 512, "completion_tokens": 24},
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "KTrFlHURRckaYnmrMzaOJIlicIXIoTft",
+                        "name": "calculate_timestamp",
+                        "arguments": '{"days_ago": -5}',
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "KTrFlHURRckaYnmrMzaOJIlicIXIoTft",
+                        "output": [
+                            {
+                                "type": "input_text",
+                                "text": '{"calculated_iso": "2026-08-18T13:41:30.395458+00:00"}',
+                            }
+                        ],
+                    },
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "Five days from now, it will be **August 18, 2026**.",
+                            }
+                        ],
+                    },
+                ],
+            },
+        ],
+    }
+
+
 def run_turn(pipeline, exporter, with_tools=False, with_sources=False):
     asyncio.run(pipeline.inlet(inlet_body(with_tools), USER))
     asyncio.run(pipeline.outlet(outlet_body(with_tools, with_sources), USER))
@@ -200,6 +259,30 @@ def test_generation_and_prompt_span_are_nested_under_root():
 
     # The generation spans the real request, so it must be longer than a point event.
     assert generation.end_time > generation.start_time
+
+
+def test_output_items_become_tool_observations():
+    """The real Open WebUI outlet shape must produce Type=TOOL observations.
+
+    Regression test: the first implementation only understood `tool_calls` /
+    `role: "tool"` messages, a shape the outlet filter never receives, so tool calls
+    that plainly happened were missing from the Langfuse UI.
+    """
+    pipeline, exporter = build_pipeline()
+    asyncio.run(pipeline.inlet(inlet_body(), USER))
+    asyncio.run(pipeline.outlet(outlet_body_real_shape(), USER))
+    pipeline.langfuse.flush()
+
+    spans = list(exporter.get_finished_spans())
+    _, roots = index_spans(spans)
+    root = roots[0]
+
+    tool = next(
+        s for s in children_of(spans, root) if s.name == "tool:calculate_timestamp"
+    )
+    assert tool.attributes.get(OBSERVATION_TYPE) == "tool"
+    assert json.loads(tool.attributes["langfuse.observation.input"]) == {"days_ago": -5}
+    assert "2026-08-18" in tool.attributes["langfuse.observation.output"]
 
 
 def test_tool_calls_and_sources_become_nested_observations():

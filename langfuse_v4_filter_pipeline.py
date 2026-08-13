@@ -495,15 +495,84 @@ class Pipeline:
         return datetime.fromtimestamp(generation_started_at + prefill_ns / 1e9, tz=timezone.utc)
 
     @staticmethod
-    def _extract_tool_calls(messages: List[dict]) -> List[Dict[str, Any]]:
-        """Reconstruct tool invocations from the message list of the current turn.
+    def _parse_arguments(arguments: Any) -> Any:
+        if isinstance(arguments, str):
+            try:
+                return json.loads(arguments)
+            except (ValueError, TypeError):
+                return arguments
+        return arguments
 
-        Open WebUI hands the filter the finished conversation, so the tool calls and
-        their results are recovered by pairing assistant ``tool_calls`` entries with
-        the ``role: "tool"`` messages that answer them.
+    @staticmethod
+    def _output_item_text(parts: Any) -> str:
+        """Flatten the content parts of an Open WebUI output item."""
+        if isinstance(parts, str):
+            return parts
+        if not isinstance(parts, list):
+            return ""
+        texts = []
+        for part in parts:
+            if isinstance(part, dict):
+                text = part.get("text")
+                if text is not None:
+                    texts.append(str(text))
+            elif isinstance(part, str):
+                texts.append(part)
+        return "".join(texts)
+
+    @classmethod
+    def _extract_tool_calls(cls, messages: List[dict]) -> List[Dict[str, Any]]:
+        """Reconstruct tool invocations for the current turn.
+
+        Open WebUI's outlet filter does NOT receive `tool_calls` or `role: "tool"`
+        messages: `outlet_filter_handler` in utils/middleware.py rebuilds each message
+        from a fixed whitelist (id, role, content, info, timestamp, output, usage,
+        sources). Tool activity survives only inside the assistant message's `output`
+        list, as `function_call` / `function_call_output` items (utils/misc.py).
+
+        So the assistant message's `output` is the primary source. The OpenAI-shaped
+        `tool_calls` / `role: "tool"` pairing is kept as a fallback for callers that
+        do pass that shape through.
         """
         messages = messages or []
-        # Only look at the tail of the conversation belonging to this turn.
+
+        tool_calls: List[Dict[str, Any]] = []
+
+        # Primary: output items on the last assistant message (the current turn).
+        assistant = get_last_assistant_message_obj(messages)
+        output_items = assistant.get("output")
+        if isinstance(output_items, list):
+            results_by_call_id: Dict[str, Dict[str, Any]] = {}
+            for item in output_items:
+                if isinstance(item, dict) and item.get("type") == "function_call_output":
+                    call_id = str(item.get("call_id") or "")
+                    if call_id:
+                        results_by_call_id[call_id] = item
+
+            for item in output_items:
+                if not isinstance(item, dict) or item.get("type") != "function_call":
+                    continue
+                call_id = str(item.get("call_id") or "")
+                result = results_by_call_id.get(call_id, {})
+                metadata: Dict[str, Any] = {"source": "output_items"}
+                if call_id:
+                    metadata["call_id"] = call_id
+                if result.get("status"):
+                    metadata["status"] = result["status"]
+                tool_calls.append(
+                    {
+                        "name": item.get("name") or "tool",
+                        "input": cls._parse_arguments(item.get("arguments")),
+                        "output": cls._output_item_text(result.get("output")) or None,
+                        "metadata": metadata,
+                    }
+                )
+
+        if tool_calls:
+            return tool_calls
+
+        # Fallback: OpenAI-shaped tool_calls paired with role:"tool" messages, scoped
+        # to the tail of the conversation after the last user message.
         start = 0
         for index in range(len(messages) - 1, -1, -1):
             if messages[index].get("role") == "user":
@@ -518,27 +587,21 @@ class Pipeline:
                 if call_id:
                     results_by_id[str(call_id)] = message
 
-        tool_calls: List[Dict[str, Any]] = []
         for message in turn_messages:
             for call in message.get("tool_calls") or []:
                 if not isinstance(call, dict):
                     continue
                 function = call.get("function") or {}
-                name = function.get("name") or call.get("name") or "tool"
-                arguments = function.get("arguments")
-                if isinstance(arguments, str):
-                    try:
-                        arguments = json.loads(arguments)
-                    except (ValueError, TypeError):
-                        pass
                 call_id = str(call.get("id") or "")
                 result = results_by_id.get(call_id, {})
                 tool_calls.append(
                     {
-                        "name": name,
-                        "input": arguments,
+                        "name": function.get("name") or call.get("name") or "tool",
+                        "input": cls._parse_arguments(function.get("arguments")),
                         "output": _content_to_text(result.get("content")) or None,
-                        "metadata": {"tool_call_id": call_id} if call_id else {},
+                        "metadata": {"call_id": call_id, "source": "tool_calls"}
+                        if call_id
+                        else {"source": "tool_calls"},
                     }
                 )
         return tool_calls
