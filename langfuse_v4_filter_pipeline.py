@@ -373,6 +373,20 @@ class Pipeline:
         features = metadata.get("features") or {}
         params = metadata.get("params") or {}
 
+        # Open WebUI also injects *builtin* tools (time, knowledge, memory, web
+        # search, ...) that never appear anywhere in the inlet body. Mirror the
+        # server's own gate from utils/middleware.py so the trace shows whether they
+        # were in play. The `time` category (get_current_timestamp,
+        # calculate_timestamp) is on by default and needs no feature flag.
+        model_meta = ((metadata.get("model") or {}).get("info") or {}).get("meta") or {}
+        capabilities = model_meta.get("capabilities") or {}
+        builtin_tools_config = model_meta.get("builtinTools") or {}
+        builtin_tools_active = bool(
+            metadata.get("session_id")
+            and params.get("function_calling") != "legacy"
+            and capabilities.get("builtin_tools", True)
+        )
+
         return {
             "tool_ids": tool_ids,
             "tool_server_count": len(tool_servers),
@@ -384,10 +398,14 @@ class Pipeline:
             "code_interpreter": bool(features.get("code_interpreter")),
             "web_search": bool(features.get("web_search")),
             "function_calling": params.get("function_calling"),
+            "builtin_tools_active": builtin_tools_active,
+            "builtin_time_tools": builtin_tools_active
+            and bool(builtin_tools_config.get("time", True)),
             "any_tools_attached": bool(
                 tool_ids
                 or tool_servers
                 or payload_tools
+                or builtin_tools_active
                 or features.get("code_interpreter")
                 or features.get("web_search")
             ),

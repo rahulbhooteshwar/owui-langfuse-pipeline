@@ -176,9 +176,13 @@ Keep it out.
   run after it). So the traced `input` is what the client sent, not the final payload
   the model saw — unlike agent-side integrations such as pi-langfuse, which hook the
   provider request itself. To compensate, the root observation carries a
-  `tools_available` metadata block (`tool_ids`, tool server count, code-interpreter and
-  web-search flags, `function_calling` mode, `any_tools_attached`) so you can still tell
-  "the model declined to call a tool" apart from "no tool was ever attached".
+  `tools_available` metadata block so you can still tell "the model declined to call a
+  tool" apart from "no tool was ever attached": `tool_ids`, tool server count, payload
+  tool names, code-interpreter and web-search flags, `function_calling` mode, and
+  `builtin_tools_active` / `builtin_time_tools`. That last pair matters — any UI request
+  whose `function_calling` is not `legacy` silently gets Open WebUI's builtin tools
+  (including `get_current_timestamp` and `calculate_timestamp`), which appear nowhere in
+  the inlet body, so a trace with no `tool_ids` is **not** a trace without tools.
 * **Turns need both hooks.** If a request is cancelled, or the pipelines server restarts
   between `inlet` and `outlet`, the turn is closed by the TTL sweep and exported with
   level `WARNING` and a status message rather than being lost.

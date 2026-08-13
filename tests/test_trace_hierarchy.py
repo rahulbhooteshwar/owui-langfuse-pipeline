@@ -273,8 +273,31 @@ def test_tool_availability_distinguishes_no_tools_from_unused_tools():
     availability = json.loads(
         root.attributes["langfuse.observation.metadata.tools_available"]
     )
-    assert availability["any_tools_attached"] is False
     assert availability["tool_ids"] == []
+    # A UI request with non-legacy function calling still gets Open WebUI's builtin
+    # tools (get_current_timestamp / calculate_timestamp), so tools WERE attached.
+    assert availability["builtin_tools_active"] is True
+    assert availability["builtin_time_tools"] is True
+    assert availability["any_tools_attached"] is True
+
+    # Legacy function calling disables builtin tool injection server-side.
+    pipeline, exporter = build_pipeline()
+    legacy = inlet_body()
+    legacy["metadata"] = {
+        **legacy["metadata"],
+        "message_id": "msg-legacy",
+        "params": {"function_calling": "legacy"},
+    }
+    asyncio.run(pipeline.inlet(legacy, USER))
+    asyncio.run(pipeline.on_shutdown())
+    pipeline.langfuse.flush()
+
+    root = next(s for s in exporter.get_finished_spans() if s.attributes.get(AS_ROOT))
+    availability = json.loads(
+        root.attributes["langfuse.observation.metadata.tools_available"]
+    )
+    assert availability["builtin_tools_active"] is False
+    assert availability["any_tools_attached"] is False
 
     # tool_ids sits at the top level of the body at inlet time, not under metadata.
     pipeline, exporter = build_pipeline()
