@@ -354,6 +354,46 @@ class Pipeline:
         return params
 
     @staticmethod
+    def _tool_availability(body: dict, metadata: dict) -> Dict[str, Any]:
+        """Record which tools this request could actually reach.
+
+        Open WebUI runs pipeline inlet filters *before* it resolves tools and injects
+        their specs into the payload (utils/middleware.py: the inlet filter runs at
+        `process_pipeline_inlet_filter`, tool resolution and
+        `chat_completion_tools_handler` run afterwards). So `body["messages"]` here is
+        the pre-injection payload and cannot tell you whether tools were available.
+
+        These fields can, and they separate "the model chose not to call a tool" from
+        "no tool was ever attached to the request". Note `tool_ids` still sits at the
+        top level of the body at inlet time; it is moved into metadata later.
+        """
+        tool_ids = body.get("tool_ids") or metadata.get("tool_ids") or []
+        tool_servers = metadata.get("tool_servers") or []
+        payload_tools = body.get("tools") or []
+        features = metadata.get("features") or {}
+        params = metadata.get("params") or {}
+
+        return {
+            "tool_ids": tool_ids,
+            "tool_server_count": len(tool_servers),
+            "payload_tools": [
+                (tool.get("function") or {}).get("name")
+                for tool in payload_tools
+                if isinstance(tool, dict)
+            ],
+            "code_interpreter": bool(features.get("code_interpreter")),
+            "web_search": bool(features.get("web_search")),
+            "function_calling": params.get("function_calling"),
+            "any_tools_attached": bool(
+                tool_ids
+                or tool_servers
+                or payload_tools
+                or features.get("code_interpreter")
+                or features.get("web_search")
+            ),
+        }
+
+    @staticmethod
     def _extract_usage(assistant_message_obj: dict) -> Tuple[Optional[Dict[str, int]], Optional[Dict[str, float]]]:
         """Map Open WebUI / Ollama / OpenAI usage payloads to v4 usage_details."""
         info = assistant_message_obj.get("usage")
@@ -581,12 +621,14 @@ class Pipeline:
         user_message_obj = get_last_user_message_obj(messages)
         user_prompt = _content_to_text(user_message_obj.get("content"))
 
+        tools_available = self._tool_availability(body, metadata)
         observation_metadata = {
             **{k: v for k, v in metadata.items() if k != "model"},
             "interface": "open-webui",
             "model_id": model_id,
             "model_name": model_name,
             "user_id": user_id,
+            "tools_available": tools_available,
         }
 
         try:
@@ -614,9 +656,9 @@ class Pipeline:
                         input=user_prompt,
                         metadata={
                             "message_id": user_message_obj.get("id"),
-                            "files": metadata.get("files"),
-                            "tool_ids": metadata.get("tool_ids"),
+                            "files": body.get("files") or metadata.get("files"),
                             "features": metadata.get("features"),
+                            "tools_available": tools_available,
                         },
                     )
                     prompt_span.end()

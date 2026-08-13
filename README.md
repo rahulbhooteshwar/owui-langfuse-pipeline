@@ -169,6 +169,16 @@ Keep it out.
   `outlet` for filters, so time-to-first-token cannot be measured directly. It is derived
   from `load_duration` + `prompt_eval_duration` when the backend (e.g. Ollama) reports
   them.
+* **The generation input is the pre-injection payload.** Open WebUI runs pipeline inlet
+  filters *before* it resolves tools, injects tool specs, applies the model's system
+  prompt and merges RAG context (`utils/middleware.py`: the inlet filter runs at
+  `process_pipeline_inlet_filter`, tool resolution and `chat_completion_tools_handler`
+  run after it). So the traced `input` is what the client sent, not the final payload
+  the model saw — unlike agent-side integrations such as pi-langfuse, which hook the
+  provider request itself. To compensate, the root observation carries a
+  `tools_available` metadata block (`tool_ids`, tool server count, code-interpreter and
+  web-search flags, `function_calling` mode, `any_tools_attached`) so you can still tell
+  "the model declined to call a tool" apart from "no tool was ever attached".
 * **Turns need both hooks.** If a request is cancelled, or the pipelines server restarts
   between `inlet` and `outlet`, the turn is closed by the TTL sweep and exported with
   level `WARNING` and a status message rather than being lost.

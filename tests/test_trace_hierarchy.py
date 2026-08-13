@@ -256,6 +256,43 @@ def test_abandoned_turn_is_still_exported():
     assert any(s.attributes.get("langfuse.observation.level") == "WARNING" for s in spans)
 
 
+def test_tool_availability_distinguishes_no_tools_from_unused_tools():
+    """Open WebUI hides tool specs from the filter, so record what was attached.
+
+    Without this you cannot tell "the model declined to call a tool" apart from
+    "no tool was ever attached to the request".
+    """
+    pipeline, exporter = build_pipeline()
+
+    bare = inlet_body()
+    asyncio.run(pipeline.inlet(bare, USER))
+    asyncio.run(pipeline.outlet(outlet_body(), USER))
+    pipeline.langfuse.flush()
+
+    root = next(s for s in exporter.get_finished_spans() if s.attributes.get(AS_ROOT))
+    availability = json.loads(
+        root.attributes["langfuse.observation.metadata.tools_available"]
+    )
+    assert availability["any_tools_attached"] is False
+    assert availability["tool_ids"] == []
+
+    # tool_ids sits at the top level of the body at inlet time, not under metadata.
+    pipeline, exporter = build_pipeline()
+    with_tools = inlet_body()
+    with_tools["tool_ids"] = ["get_current_time"]
+    with_tools["metadata"] = {**with_tools["metadata"], "message_id": "msg-9"}
+    asyncio.run(pipeline.inlet(with_tools, USER))
+    asyncio.run(pipeline.on_shutdown())
+    pipeline.langfuse.flush()
+
+    root = next(s for s in exporter.get_finished_spans() if s.attributes.get(AS_ROOT))
+    availability = json.loads(
+        root.attributes["langfuse.observation.metadata.tools_available"]
+    )
+    assert availability["any_tools_attached"] is True
+    assert availability["tool_ids"] == ["get_current_time"]
+
+
 def test_module_loads_the_way_the_pipelines_server_loads_it():
     """The pipelines server never registers the module in sys.modules.
 
