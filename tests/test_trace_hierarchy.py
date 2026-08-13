@@ -256,6 +256,28 @@ def test_abandoned_turn_is_still_exported():
     assert any(s.attributes.get("langfuse.observation.level") == "WARNING" for s in spans)
 
 
+def test_module_loads_the_way_the_pipelines_server_loads_it():
+    """The pipelines server never registers the module in sys.modules.
+
+    That breaks pydantic's resolution of postponed annotations, so the pipeline must
+    not rely on `from __future__ import annotations`.
+    """
+    import importlib.util
+
+    path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "langfuse_v4_filter_pipeline.py",
+    )
+    spec = importlib.util.spec_from_file_location("langfuse_v4_filter_pipeline_isolated", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert "langfuse_v4_filter_pipeline_isolated" not in sys.modules
+
+    pipeline = module.Pipeline()
+    assert pipeline.type == "filter"
+    assert pipeline.valves.pipelines == ["*"]
+
+
 def test_outlet_without_inlet_does_not_crash():
     pipeline, exporter = build_pipeline()
     asyncio.run(pipeline.outlet(outlet_body(), USER))

@@ -12,7 +12,10 @@ description: >
 requirements: langfuse>=4.7.0
 """
 
-from __future__ import annotations
+# NOTE: do NOT add `from __future__ import annotations` to this file. The Open WebUI
+# pipelines server loads pipelines with importlib.util.module_from_spec() without
+# registering them in sys.modules, so pydantic cannot resolve postponed (string)
+# annotations and Valves fails to build with "`Valves` is not fully defined".
 
 import json
 import os

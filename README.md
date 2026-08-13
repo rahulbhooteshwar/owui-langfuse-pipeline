@@ -149,7 +149,14 @@ pip install langfuse>=4.7.0 pydantic
 python tests/test_trace_hierarchy.py     # or: pytest tests
 ```
 
-Verified against `langfuse` 4.7.0 and 4.14.4.
+Verified against `langfuse` 4.7.0 and 4.14.4, and against the version pair shipped in
+the `ghcr.io/open-webui/pipelines:main` image (`langfuse` 4.14.4 + `pydantic` 2.7.1).
+
+One of the tests loads the pipeline exactly the way the pipelines server does —
+`importlib.util.module_from_spec()` **without** registering it in `sys.modules`. Under
+that loader pydantic cannot resolve postponed annotations, so `from __future__ import
+annotations` in this file would break `Valves` with ``` `Valves` is not fully defined ```.
+Keep it out.
 
 ## Known limitations
 
