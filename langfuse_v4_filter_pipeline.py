@@ -691,6 +691,35 @@ class Pipeline:
         }
 
     @staticmethod
+    def _context_features(
+        metadata: dict, model_info: Dict[str, Any], is_task: bool = False
+    ) -> Dict[str, Any]:
+        """Record what Open WebUI will inject into the prompt after the filter returns.
+
+        Every one of these adds text to the payload between
+        `process_pipeline_inlet_filter` and the provider call, so none of it can appear
+        in the traced input. Memory is the clearest case: `add_memory_context` appends
+        a ``<memory_context>`` block to the system message about thirty lines after the
+        filter hands the body back (utils/middleware.py), and the outlet payload is
+        rebuilt from the *stored* chat messages, which never contain it either -- so
+        the memory a model plainly used is invisible from both hooks.
+
+        The flags are visible at inlet even though their text is not, so the trace can
+        at least name what accounts for the gap `_reconcile_input` measures, instead of
+        leaving an unattributed pile of hidden tokens.
+        """
+        features = {} if is_task else (metadata.get("features") or {})
+        knowledge = ((model_info.get("info") or {}).get("meta") or {}).get("knowledge")
+        return {
+            "memory": bool(features.get("memory")),
+            "web_search": bool(features.get("web_search")),
+            "image_generation": bool(features.get("image_generation")),
+            "code_interpreter": bool(features.get("code_interpreter")),
+            "voice": bool(features.get("voice")),
+            "model_knowledge_count": len(knowledge) if isinstance(knowledge, list) else 0,
+        }
+
+    @staticmethod
     def _summarize_task_body(task_body: dict) -> Dict[str, Any]:
         """Compact ``metadata["task_body"]``, which is the whole triggering chat request.
 
@@ -778,6 +807,7 @@ class Pipeline:
         captured_messages: List[dict],
         usage_details: Optional[Dict[str, int]],
         tools_available: Optional[Dict[str, Any]],
+        context_features: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Measure how much of the real prompt the filter never saw.
 
@@ -819,8 +849,9 @@ class Pipeline:
         }
         # Only the flags that plausibly explain injected context, so the field reads
         # as a shortlist of suspects rather than a copy of the whole tool summary.
+        suspects: Dict[str, Any] = {}
         if tools_available:
-            reconciliation["suspects"] = {
+            suspects = {
                 key: tools_available.get(key)
                 for key in (
                     "any_tools_attached",
@@ -835,6 +866,14 @@ class Pipeline:
                 )
                 if tools_available.get(key)
             }
+        # Tool manifests are not the only thing injected after the filter -- memory and
+        # knowledge context are usually the larger half, and are what makes a two-line
+        # prompt bill as five thousand tokens.
+        for key, value in (context_features or {}).items():
+            if value:
+                suspects[key] = value
+        if suspects:
+            reconciliation["suspects"] = suspects
         return reconciliation
 
     @staticmethod
@@ -1132,6 +1171,7 @@ class Pipeline:
         user_prompt = _content_to_text(user_message_obj.get("content"))
 
         tools_available = self._tool_availability(body, metadata, model_info, is_task)
+        context_features = self._context_features(metadata, model_info, is_task)
         system_prompt, system_prompt_source = self._resolve_system_prompt(
             body, metadata, model_info
         )
@@ -1159,6 +1199,9 @@ class Pipeline:
             # while nested keys are only readable inside the JSON blob. Outlet
             # overwrites it once the tools that actually ran are known.
             "available_tool_count": tools_available["available_tool_count"],
+            # What Open WebUI will add to the prompt after this filter returns. The
+            # text is unreachable from either hook; the flags are not.
+            "context_features": context_features,
             "system_prompt": system_prompt,
             "system_prompt_source": system_prompt_source,
         }
@@ -1249,6 +1292,7 @@ class Pipeline:
             # outlet can reconcile against the provider's token count.
             "generation_input": generation_input,
             "tools_available": tools_available,
+            "context_features": context_features,
         }
 
         with self._lock:
@@ -1310,6 +1354,7 @@ class Pipeline:
                 turn.get("generation_input") or turn.get("messages") or [],
                 usage_details,
                 tools_available,
+                turn.get("context_features"),
             )
             if reconciliation and reconciliation["hidden_input_tokens_estimated"] > 0:
                 self.log(

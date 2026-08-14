@@ -223,6 +223,21 @@ Keep it out.
   tokenizer would mean shipping one with the pipeline, and the question this answers
   is whether the model saw ~30 tokens or ~5,000, which no plausible tokenizer error
   changes.
+* **Memory never appears in the traced prompt, and cannot.** `add_memory_context`
+  appends a `<memory_context>` block to the system message about thirty lines after
+  `process_pipeline_inlet_filter` returns (`utils/middleware.py`), so the inlet body
+  predates it. The outlet body is no help either: it is rebuilt from the *stored* chat
+  messages, which never held the memory-augmented system message at all. So a model can
+  visibly answer from memory while the trace shows a bare two-line prompt — that is the
+  filter's vantage point, not a gap in what the pipeline records. The same applies to
+  model knowledge (RAG), web-search results and image-generation context. What the
+  trace can do is name them: the `context_features` block
+  (`memory`, `web_search`, `image_generation`, `code_interpreter`, `voice`,
+  `model_knowledge_count`) is read from `metadata["features"]` and the model record at
+  inlet, and its active entries are folded into `input_reconciliation.suspects`, so a
+  two-line prompt that billed 5,248 tokens says *why*. If you need the literal final
+  prompt, it has to be captured at the provider boundary — a proxy in front of the
+  inference endpoint — because no Open WebUI filter hook is ever shown it.
 * **Abandoned turns report no latency.** A turn whose `outlet` never arrives is closed
   by the TTL sweep, but it is ended at the turn's *start*, not at sweep time. Ending it
   at sweep time gave every abandoned turn a duration of at least

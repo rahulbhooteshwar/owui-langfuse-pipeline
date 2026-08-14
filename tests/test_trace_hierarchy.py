@@ -899,6 +899,49 @@ def test_reconciliation_reports_context_injected_after_inlet():
     assert report["suspects"]["builtin_tools_active"] is True
 
 
+def test_memory_is_named_as_the_source_of_the_hidden_context():
+    """Memory text is unreachable from a filter; the flag that explains it is not.
+
+    Shape and numbers are from a real trace: a two-line prompt that billed 5,248 input
+    tokens because `add_memory_context` appended a <memory_context> block to the system
+    message ~30 lines after `process_pipeline_inlet_filter` returned. Without the flag
+    the trace shows 99% of the prompt as unattributed hidden tokens.
+    """
+    pipeline, exporter = build_pipeline()
+    body = inlet_body()
+    body["messages"] = [
+        {"role": "system", "content": "You are a helpful assistant working via Open Web UI Harness"},
+        {"role": "user", "id": "um-1", "content": "where Did I worked earlier?"},
+    ]
+    body["metadata"] = {
+        **body["metadata"],
+        "features": {"memory": True, "web_search": False},
+        "model": {
+            "id": "gpt-4o",
+            "name": "GPT-4o",
+            "info": {"meta": {"knowledge": [{"id": "kb-1"}, {"id": "kb-2"}]}},
+        },
+    }
+    asyncio.run(pipeline.inlet(body, USER))
+
+    out = outlet_body()
+    out["messages"][-1]["usage"] = {"prompt_tokens": 5248, "completion_tokens": 140}
+    asyncio.run(pipeline.outlet(out, USER))
+    pipeline.langfuse.flush()
+
+    assert root_metadata(exporter, "context_features")["memory"] is True
+    assert root_metadata(exporter, "context_features")["model_knowledge_count"] == 2
+
+    generation = [s for s in exporter.get_finished_spans() if s.name.startswith("llm:")][0]
+    report = json.loads(
+        generation.attributes["langfuse.observation.metadata.input_reconciliation"]
+    )
+    assert report["hidden_input_tokens_estimated"] > 5000
+    # The point: the gap now has a named cause instead of just a size.
+    assert report["suspects"]["memory"] is True
+    assert report["suspects"]["model_knowledge_count"] == 2
+
+
 def test_reconciliation_absent_when_provider_reports_no_usage():
     pipeline, exporter = build_pipeline()
     asyncio.run(pipeline.inlet(inlet_body(), USER))
