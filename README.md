@@ -126,8 +126,9 @@ Set `debug: true` on the valves to print the connection and per-turn trace ids.
 | `insert_tags` | `true` | Adds the `open-webui` tag, plus the task name for background tasks |
 | `use_model_name_instead_of_id_for_generation` | `false` | Use the display name rather than the model id on generations |
 | `user_id_field` | `email` | Which Open WebUI user field becomes the Langfuse `user_id` |
+| `include_system_prompt_in_input` | `true` | Prepend the model's configured system prompt to the traced messages |
 | `capture_user_prompt_span` | `true` | Emit the `user_prompt` child span |
-| `capture_tool_calls` | `true` | Emit `tool` observations reconstructed from `tool_calls` |
+| `capture_tool_calls` | `true` | Emit `tool` observations reconstructed from the assistant's `output` items |
 | `capture_sources_as_retriever` | `true` | Emit `retriever` observations from Open WebUI citations |
 | `capture_task_traces` | `true` | Trace title/tag/query generation calls (as their own traces) |
 | `set_trace_io` | `true` | Also write trace-level input/output (trace-list preview, legacy evaluators) |
