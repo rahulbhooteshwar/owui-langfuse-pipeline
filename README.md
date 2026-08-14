@@ -78,12 +78,34 @@ Concretely:
 | Root observation | never ended → never exported | `agent` observation, ended in `outlet` |
 | LLM generation | created *after* the fact, ~0 ms | opened in `inlet`, closed in `outlet` → real latency |
 | Tool calls | not captured | `tool` observations under the root |
+| Tool counts | not captured | `available_tool_count` / `tool_call_count` on the root |
 | RAG / web search | not captured | `retriever` observations under the root |
 | Usage | `{input, output, unit: TOKENS}` | `usage_details` + `cost_details`, incl. cached & reasoning tokens |
 | Model parameters | not captured | temperature, top_p, max_tokens, seed, … |
-| Background tasks | mixed into the chat trace | own trace, typed `chain` |
+| Background tasks | mixed into the chat trace | own trace, typed `chain`, exported at `inlet`, on the task model |
 | Trace attributes | `update_trace()` (removed in v4) | `propagate_attributes()` on every observation |
 | Memory | `chat_traces` grows forever | TTL + size cap, orphans closed and exported |
+
+### Tool counts
+
+The root observation carries both numbers as top-level metadata keys, so they can be
+filtered and charted in Langfuse rather than read out of a JSON blob:
+
+| Key | Where it comes from |
+|---|---|
+| `available_tool_count` | tools reachable by the request — see the floor caveat below |
+| `tool_call_count` | tool invocations reconstructed from the assistant's `output` items |
+| `tools_available` | the full breakdown: names, per-source counts, feature flags |
+| `tool_calls` | `count`, `unique_count`, `names`, `calls_by_name`, `source` |
+
+`available_tool_count` is written at `inlet` and rewritten at `outlet`, because the two
+ends see different things. At `inlet` it sums the tools picked for the request
+(`tool_ids`), the tools bound to the model record (`toolIds`), any specs already in
+`body["tools"]`, every function each tool server exposes, and Open WebUI's builtin
+`time` tools. At `outlet` it takes in the tools that were actually called — which is
+what keeps it off zero for requests whose tools are all resolved after the filter runs.
+`tool_call_count` is recorded even with `capture_tool_calls` off; that valve controls
+the per-call observations, not the counting.
 
 ## Install
 
@@ -128,9 +150,9 @@ Set `debug: true` on the valves to print the connection and per-turn trace ids.
 | `user_id_field` | `email` | Which Open WebUI user field becomes the Langfuse `user_id` |
 | `include_system_prompt_in_input` | `true` | Prepend the model's configured system prompt to the traced messages |
 | `capture_user_prompt_span` | `true` | Emit the `user_prompt` child span |
-| `capture_tool_calls` | `true` | Emit `tool` observations reconstructed from the assistant's `output` items |
+| `capture_tool_calls` | `true` | Emit `tool` observations reconstructed from the assistant's `output` items (the `tool_call_count` metadata is recorded either way) |
 | `capture_sources_as_retriever` | `true` | Emit `retriever` observations from Open WebUI citations |
-| `capture_task_traces` | `true` | Trace title/tag/query generation calls (as their own traces) |
+| `capture_task_traces` | `true` | Trace title/tag/query/follow-up generation calls (own traces, closed at `inlet`) |
 | `set_trace_io` | `true` | Also write trace-level input/output (trace-list preview, legacy evaluators) |
 | `flush_on_outlet` | `true` | Flush synchronously after each turn; turn off for throughput |
 | `capture_input_reconciliation` | `true` | Record how many input tokens the provider counted that the filter never saw |
@@ -143,8 +165,9 @@ Set `debug: true` on the valves to print the connection and per-turn trace ids.
 No Langfuse server required — the tests attach an in-memory OTel exporter and assert on
 the exact spans that would be shipped: that exactly one root observation exists, that it
 is typed `agent` and marked `as_root`, that the generation/tool/retriever observations
-are its children, that `user.id` / `session.id` / trace name are on every span, and that
-abandoned turns are still exported.
+are its children, that `user.id` / `session.id` / trace name are on every span, that both
+tool counts land on the root, that background task traces are exported without waiting
+for an outlet, and that abandoned turns are still exported.
 
 ```bash
 pip install langfuse>=4.7.0 pydantic
@@ -243,12 +266,49 @@ Keep it out.
   whose `function_calling` is not `legacy` silently gets Open WebUI's builtin tools
   (including `get_current_timestamp` and `calculate_timestamp`), which appear nowhere in
   the inlet body, so a trace with no `tool_ids` is **not** a trace without tools.
+* **`available_tool_count` is a floor, not a census.** The same pre-injection problem
+  makes an exact count impossible from a filter: a `tool_ids` entry names a tool
+  *module* that `get_tools` expands into one spec per callable function, and that
+  expansion happens after the filter runs. The count therefore sums what is provably
+  reachable — tools picked for the request, tools bound to the model record, specs in
+  `body["tools"]`, every function each tool server exposes, and the builtin `time`
+  tools — and `outlet` raises it with the tools the turn actually called, since a tool
+  that ran was by definition available. `available_tool_sources` shows the breakdown and
+  `available_tool_count_is_lower_bound` marks it for what it is.
 * **Turns need both hooks.** If a request is cancelled, or the pipelines server restarts
   between `inlet` and `outlet`, the turn is closed by the TTL sweep and exported with
   level `WARNING` and a status message rather than being lost.
-* Depending on the Open WebUI version, background task requests may not call `outlet`;
-  those traces close via the same TTL sweep. Set `capture_task_traces: false` to skip
-  them entirely.
+* **A background task's model comes from `body["model"]`, never from the metadata.**
+  Open WebUI runs title, tags and follow-up generation on the configured task model
+  (`task.model.default` / `task.model.external`, resolved by `get_task_model_id`) —
+  which can be an entirely different provider from the chat. That model reaches the
+  filter only as the top-level `body["model"]`. The metadata travelling with the task
+  describes the *chat*: `routers/tasks.py` builds the payload as
+  `{**request.state.metadata, "task": …, "task_body": …}` and
+  `generate_chat_completion` merges `request.state.metadata` over it again, so
+  `metadata["model"]` is the record for the model the conversation is using. Taking the
+  model from there labelled every task trace with the chat's model — and pulled that
+  model's system prompt, `toolIds` and capabilities onto the task trace with it. The
+  record is now used only when its own `id` matches `body["model"]`; when it does not,
+  it is traced as `chat_model_id` / `chat_model_name`, which is the useful thing it
+  actually says. For the same reason a task trace reports no tools at all: task
+  payloads are hand-built and never go through `process_chat_payload`, so the
+  `tool_ids`, `features` and `params` riding along on them belong to the chat.
+  `task_body` — the entire triggering chat request, transcript included — is traced as
+  a summary rather than copied into every task trace.
+* **Background task traces are closed at `inlet`.** Open WebUI calls the outlet filter
+  only for the user-visible chat turn — title, tags, follow-up, query and autocomplete
+  generation go through `generate_chat_completion`, whose response goes straight back to
+  the caller, so the inlet is the only half of those requests a filter ever sees. Held
+  open waiting for an outlet that never comes, they reached Langfuse only when the TTL
+  sweep or a clean shutdown collected them: up to `open_turn_ttl_seconds` late, flagged
+  `WARNING` / `abandoned`, and lost outright if the container was killed first — which
+  is what made task traces show up erratically. They are now completed and exported in
+  the same request, marked `closed_at_inlet` / `outlet_not_called_by_design`. The trade
+  is a latency measurement the filter never had for a task anyway, so the generation
+  carries `latency_is_unknown` along with `output_unavailable` / `usage_unavailable`:
+  their prompt, model and parameters are traced, their response and token counts are
+  not observable from a filter. Set `capture_task_traces: false` to skip them entirely.
 
 ## References
 
