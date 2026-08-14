@@ -126,12 +126,14 @@ Set `debug: true` on the valves to print the connection and per-turn trace ids.
 | `insert_tags` | `true` | Adds the `open-webui` tag, plus the task name for background tasks |
 | `use_model_name_instead_of_id_for_generation` | `false` | Use the display name rather than the model id on generations |
 | `user_id_field` | `email` | Which Open WebUI user field becomes the Langfuse `user_id` |
+| `include_system_prompt_in_input` | `true` | Prepend the model's configured system prompt to the traced messages |
 | `capture_user_prompt_span` | `true` | Emit the `user_prompt` child span |
-| `capture_tool_calls` | `true` | Emit `tool` observations reconstructed from `tool_calls` |
+| `capture_tool_calls` | `true` | Emit `tool` observations reconstructed from the assistant's `output` items |
 | `capture_sources_as_retriever` | `true` | Emit `retriever` observations from Open WebUI citations |
 | `capture_task_traces` | `true` | Trace title/tag/query generation calls (as their own traces) |
 | `set_trace_io` | `true` | Also write trace-level input/output (trace-list preview, legacy evaluators) |
 | `flush_on_outlet` | `true` | Flush synchronously after each turn; turn off for throughput |
+| `capture_input_reconciliation` | `true` | Record how many input tokens the provider counted that the filter never saw |
 | `open_turn_ttl_seconds` | `1800` | Close and export turns whose `outlet` never arrived |
 | `max_open_turns` | `2048` | Hard cap on in-flight turns |
 | `debug` | `false` | Verbose logging |
@@ -160,6 +162,58 @@ Keep it out.
 
 ## Known limitations
 
+* **The system prompt is only partly recoverable.** Open WebUI pops `params["system"]`
+  in `apply_params_to_form_data` before the inlet filter runs, and assembles the final
+  text into `metadata["system_prompt"]` *after* it — and the outlet body carries no
+  metadata at all. So the pipeline recovers it from the two routes that survive: a
+  system message already in `body["messages"]` (Chat Controls / user settings / API
+  caller), or the model's configured prompt via the model record in metadata, with
+  `{{USER_NAME}}` / `{{CURRENT_DATE}}` style variables rendered the way the server
+  renders them. The generation records `system_prompt` and `system_prompt_source`, and
+  `include_system_prompt_in_input` (default on) prepends it to the traced messages so
+  the Langfuse message view shows it. Text injected *after* the filter — memory
+  context, skills, tool manifests, RAG context — is not visible, so this is the base
+  prompt, flagged with `system_prompt_is_pre_injection`.
+
+  Because that hidden text is still billed, `capture_input_reconciliation` (default on)
+  measures it. At outlet the provider reports the real input-token count, so the
+  generation records an `input_reconciliation` object comparing it against an estimate
+  of what the filter captured:
+
+  ```json
+  {
+    "reported_input_tokens": 5181,
+    "captured_input_tokens_estimated": 19,
+    "hidden_input_tokens_estimated": 5162,
+    "hidden_share_estimated": 0.9963,
+    "captured_messages": 2,
+    "captured_chars": 44,
+    "estimation_method": "chars/4 + 4 per message",
+    "suspects": { "builtin_tools_active": true, "builtin_time_tools": true,
+                  "function_calling": "native" }
+  }
+  ```
+
+  A large `hidden_input_tokens_estimated` means Open WebUI injected that much context
+  after the filter ran; `suspects` lists the flags that could account for it. The
+  estimate is deliberately crude (roughly four characters per token) — a real
+  tokenizer would mean shipping one with the pipeline, and the question this answers
+  is whether the model saw ~30 tokens or ~5,000, which no plausible tokenizer error
+  changes.
+* **Abandoned turns report no latency.** A turn whose `outlet` never arrives is closed
+  by the TTL sweep, but it is ended at the turn's *start*, not at sweep time. Ending it
+  at sweep time gave every abandoned turn a duration of at least
+  `open_turn_ttl_seconds` — 30-, 70-, 90-minute observations that never happened, which
+  then dominate every latency percentile in the project. The real wait is kept as
+  `abandoned_after_seconds` metadata alongside `abandoned` and `latency_is_unknown`, so
+  it describes the turn instead of masquerading as model latency. The sweep runs on
+  both `inlet` and `outlet`; running it only on `inlet` left orphaned turns open for
+  however long the gap in traffic lasted.
+* **Background tasks are keyed separately from the chat turn.** Open WebUI fires title,
+  tag and follow-up generation with the *same* `chat_id` and `message_id` as the chat
+  turn they describe, so the in-memory turn key includes the task name. Without it the
+  task's `inlet` evicted the chat turn as "superseded by a newer request" and the
+  chat's `outlet` could finalize a task turn instead.
 * **Tool calls come from `output` items.** Open WebUI's outlet filter never receives
   `tool_calls` or `role: "tool"` messages — `outlet_filter_handler` rebuilds every
   message from a fixed whitelist (id, role, content, info, timestamp, output, usage,
