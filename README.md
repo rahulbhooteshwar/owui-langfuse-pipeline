@@ -160,6 +160,18 @@ Keep it out.
 
 ## Known limitations
 
+* **The system prompt is only partly recoverable.** Open WebUI pops `params["system"]`
+  in `apply_params_to_form_data` before the inlet filter runs, and assembles the final
+  text into `metadata["system_prompt"]` *after* it — and the outlet body carries no
+  metadata at all. So the pipeline recovers it from the two routes that survive: a
+  system message already in `body["messages"]` (Chat Controls / user settings / API
+  caller), or the model's configured prompt via the model record in metadata, with
+  `{{USER_NAME}}` / `{{CURRENT_DATE}}` style variables rendered the way the server
+  renders them. The generation records `system_prompt` and `system_prompt_source`, and
+  `include_system_prompt_in_input` (default on) prepends it to the traced messages so
+  the Langfuse message view shows it. Text injected *after* the filter — memory
+  context, skills, tool manifests, RAG context — is not visible, so this is the base
+  prompt, flagged with `system_prompt_is_pre_injection`.
 * **Tool calls come from `output` items.** Open WebUI's outlet filter never receives
   `tool_calls` or `role: "tool"` messages — `outlet_filter_handler` rebuilds every
   message from a fixed whitelist (id, role, content, info, timestamp, output, usage,

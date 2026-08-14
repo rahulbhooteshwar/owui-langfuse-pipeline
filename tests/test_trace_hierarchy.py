@@ -399,6 +399,101 @@ def test_tool_availability_distinguishes_no_tools_from_unused_tools():
     assert availability["tool_ids"] == ["get_current_time"]
 
 
+def test_system_prompt_from_messages_is_traced():
+    """A Chat Controls / user-settings system prompt arrives inside body["messages"]."""
+    pipeline, exporter = build_pipeline()
+    body = inlet_body()
+    asyncio.run(pipeline.inlet(body, USER))
+    asyncio.run(pipeline.outlet(outlet_body(), USER))
+    pipeline.langfuse.flush()
+
+    generation = next(
+        s
+        for s in exporter.get_finished_spans()
+        if s.attributes.get(OBSERVATION_TYPE) == "generation"
+    )
+    assert (
+        generation.attributes["langfuse.observation.metadata.system_prompt"]
+        == "You are helpful."
+    )
+    assert (
+        generation.attributes["langfuse.observation.metadata.system_prompt_source"]
+        == "messages"
+    )
+    traced = json.loads(generation.attributes["langfuse.observation.input"])
+    assert [m["role"] for m in traced] == ["system", "user"]
+
+
+def test_model_configured_system_prompt_is_recovered_and_rendered():
+    """Open WebUI pops params["system"] before the filter runs.
+
+    The same text is still reachable via the model record in metadata, and its
+    template variables must be rendered the way the server renders them.
+    """
+    pipeline, exporter = build_pipeline()
+    body = inlet_body()
+    # No system message in the payload -- exactly what the filter normally sees.
+    body["messages"] = [m for m in body["messages"] if m["role"] != "system"]
+    body["metadata"] = {
+        **body["metadata"],
+        "model": {
+            "id": "gpt-4o",
+            "name": "GPT-4o",
+            "info": {
+                "params": {
+                    "system": "You are an assistant for {{USER_NAME}}. "
+                    "Today is {{CURRENT_DATE}} ({{CURRENT_WEEKDAY}})."
+                }
+            },
+        },
+        "variables": {
+            "{{USER_NAME}}": "Test User",
+            "{{CURRENT_DATE}}": "2026-08-13",
+            "{{CURRENT_WEEKDAY}}": "Thursday",
+        },
+    }
+
+    asyncio.run(pipeline.inlet(body, USER))
+    asyncio.run(pipeline.outlet(outlet_body(), USER))
+    pipeline.langfuse.flush()
+
+    generation = next(
+        s
+        for s in exporter.get_finished_spans()
+        if s.attributes.get(OBSERVATION_TYPE) == "generation"
+    )
+    prompt = generation.attributes["langfuse.observation.metadata.system_prompt"]
+    assert prompt == (
+        "You are an assistant for Test User. Today is 2026-08-13 (Thursday)."
+    )
+    assert (
+        generation.attributes["langfuse.observation.metadata.system_prompt_source"]
+        == "model_params"
+    )
+
+    # It must also surface in the traced messages, not only in metadata.
+    traced = json.loads(generation.attributes["langfuse.observation.input"])
+    assert traced[0]["role"] == "system"
+    assert traced[0]["content"] == prompt
+
+    # Opting out leaves the payload byte-identical to what the client sent.
+    pipeline, exporter = build_pipeline()
+    pipeline.valves.include_system_prompt_in_input = False
+    body["metadata"] = {**body["metadata"], "message_id": "msg-no-prepend"}
+    asyncio.run(pipeline.inlet(body, USER))
+    asyncio.run(pipeline.on_shutdown())
+    pipeline.langfuse.flush()
+
+    generation = next(
+        s
+        for s in exporter.get_finished_spans()
+        if s.attributes.get(OBSERVATION_TYPE) == "generation"
+    )
+    traced = json.loads(generation.attributes["langfuse.observation.input"])
+    assert [m["role"] for m in traced] == ["user"]
+    assert generation.attributes["langfuse.observation.metadata.system_prompt_source"] == "model_params"
+
+
 def test_module_loads_the_way_the_pipelines_server_loads_it():
     """The pipelines server never registers the module in sys.modules.
 

@@ -141,6 +141,11 @@ class Pipeline:
         # Which field of the Open WebUI user object becomes the Langfuse user id.
         user_id_field: str = "email"
 
+        # Prepend the model's configured system prompt to the traced generation input
+        # so the Langfuse message view shows it. Open WebUI removes it from the body
+        # before the filter runs, so it can only be recovered from the model record.
+        include_system_prompt_in_input: bool = True
+
         # Hierarchy toggles.
         capture_user_prompt_span: bool = True
         capture_tool_calls: bool = True
@@ -352,6 +357,65 @@ class Pipeline:
                     continue
                 params[key] = value if isinstance(value, (str, int, float, bool)) else json.dumps(value, default=str)
         return params
+
+    @staticmethod
+    def _render_variables(text: str, variables: Dict[str, Any]) -> str:
+        """Substitute Open WebUI template variables into a system prompt.
+
+        Open WebUI hands the filter its variables already braced
+        (``{"{{USER_NAME}}": "..."}``), but plain keys are accepted too.
+        """
+        if not text or not variables:
+            return text
+        rendered = text
+        for key, value in variables.items():
+            if value is None:
+                continue
+            token = str(key)
+            if not token.startswith("{{"):
+                token = "{{" + token + "}}"
+            rendered = rendered.replace(token, str(value))
+        return rendered
+
+    @classmethod
+    def _resolve_system_prompt(
+        cls, body: dict, metadata: dict
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Recover the system prompt, returning ``(prompt, source)``.
+
+        The system prompt is largely invisible to an inlet filter. Open WebUI pops
+        ``params["system"]`` in `apply_params_to_form_data` and only assembles the
+        final text into ``metadata["system_prompt"]`` *after* the filter has run
+        (utils/middleware.py), and the outlet body carries no metadata at all. Two
+        routes survive:
+
+        1. A system message already in ``body["messages"]`` -- from Chat Controls,
+           user settings or an API caller. Open WebUI interpolates its variables
+           before the filter runs, so that text is final.
+        2. The model's configured system prompt, still reachable through the model
+           record in metadata. Its variables are rendered here the same way
+           `resolve_system_prompt` renders them server-side.
+
+        Neither route sees text injected after the filter (memory context, skills,
+        tool manifests, RAG context), so the result is the base prompt, not
+        necessarily the full final one.
+        """
+        for message in body.get("messages") or []:
+            if isinstance(message, dict) and message.get("role") == "system":
+                text = _content_to_text(message.get("content"))
+                if text:
+                    return text, "messages"
+
+        model_info = metadata.get("model") if isinstance(metadata.get("model"), dict) else {}
+        configured = ((model_info.get("info") or {}).get("params") or {}).get("system")
+        if configured:
+            variables = {
+                **(metadata.get("variables") or {}),
+                **(metadata.get("chat_variables") or {}),
+            }
+            return cls._render_variables(str(configured), variables), "model_params"
+
+        return None, None
 
     @staticmethod
     def _tool_availability(body: dict, metadata: dict) -> Dict[str, Any]:
@@ -703,6 +767,19 @@ class Pipeline:
         user_prompt = _content_to_text(user_message_obj.get("content"))
 
         tools_available = self._tool_availability(body, metadata)
+        system_prompt, system_prompt_source = self._resolve_system_prompt(body, metadata)
+
+        # Show the model's configured system prompt in the traced messages. Open WebUI
+        # strips it from the body before the filter runs, so without this the Langfuse
+        # message view shows a bare user turn and looks like the prompt was lost.
+        generation_input = messages
+        if (
+            system_prompt
+            and system_prompt_source == "model_params"
+            and self.valves.include_system_prompt_in_input
+        ):
+            generation_input = [{"role": "system", "content": system_prompt}, *messages]
+
         observation_metadata = {
             **{k: v for k, v in metadata.items() if k != "model"},
             "interface": "open-webui",
@@ -710,6 +787,8 @@ class Pipeline:
             "model_name": model_name,
             "user_id": user_id,
             "tools_available": tools_available,
+            "system_prompt": system_prompt,
+            "system_prompt_source": system_prompt_source,
         }
 
         try:
@@ -748,9 +827,17 @@ class Pipeline:
                     name=f"llm:{model_value}" if model_value else "llm",
                     as_type="generation",
                     model=model_value,
-                    input=messages,
+                    input=generation_input,
                     model_parameters=self._extract_model_parameters(body) or None,
-                    metadata={"model_id": model_id, "model_name": model_name},
+                    metadata={
+                        "model_id": model_id,
+                        "model_name": model_name,
+                        "system_prompt": system_prompt,
+                        "system_prompt_source": system_prompt_source,
+                        # The filter runs before Open WebUI injects memory context,
+                        # skills, tool manifests and RAG context into the prompt.
+                        "system_prompt_is_pre_injection": True,
+                    },
                 )
         except Exception as e:
             self.log(f"Failed to start trace for chat_id {chat_id}: {e}")
