@@ -82,7 +82,7 @@ Concretely:
 | RAG / web search | not captured | `retriever` observations under the root |
 | Usage | `{input, output, unit: TOKENS}` | `usage_details` + `cost_details`, incl. cached & reasoning tokens |
 | Model parameters | not captured | temperature, top_p, max_tokens, seed, … |
-| Background tasks | mixed into the chat trace | own trace, typed `chain`, exported at `inlet` |
+| Background tasks | mixed into the chat trace | own trace, typed `chain`, exported at `inlet`, on the task model |
 | Trace attributes | `update_trace()` (removed in v4) | `propagate_attributes()` on every observation |
 | Memory | `chat_traces` grows forever | TTL + size cap, orphans closed and exported |
 
@@ -278,6 +278,24 @@ Keep it out.
 * **Turns need both hooks.** If a request is cancelled, or the pipelines server restarts
   between `inlet` and `outlet`, the turn is closed by the TTL sweep and exported with
   level `WARNING` and a status message rather than being lost.
+* **A background task's model comes from `body["model"]`, never from the metadata.**
+  Open WebUI runs title, tags and follow-up generation on the configured task model
+  (`task.model.default` / `task.model.external`, resolved by `get_task_model_id`) —
+  which can be an entirely different provider from the chat. That model reaches the
+  filter only as the top-level `body["model"]`. The metadata travelling with the task
+  describes the *chat*: `routers/tasks.py` builds the payload as
+  `{**request.state.metadata, "task": …, "task_body": …}` and
+  `generate_chat_completion` merges `request.state.metadata` over it again, so
+  `metadata["model"]` is the record for the model the conversation is using. Taking the
+  model from there labelled every task trace with the chat's model — and pulled that
+  model's system prompt, `toolIds` and capabilities onto the task trace with it. The
+  record is now used only when its own `id` matches `body["model"]`; when it does not,
+  it is traced as `chat_model_id` / `chat_model_name`, which is the useful thing it
+  actually says. For the same reason a task trace reports no tools at all: task
+  payloads are hand-built and never go through `process_chat_payload`, so the
+  `tool_ids`, `features` and `params` riding along on them belong to the chat.
+  `task_body` — the entire triggering chat request, transcript included — is traced as
+  a summary rather than copied into every task trace.
 * **Background task traces are closed at `inlet`.** Open WebUI calls the outlet filter
   only for the user-visible chat turn — title, tags, follow-up, query and autocomplete
   generation go through `generate_chat_completion`, whose response goes straight back to

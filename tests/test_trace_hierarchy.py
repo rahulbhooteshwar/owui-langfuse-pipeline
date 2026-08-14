@@ -403,9 +403,14 @@ def test_tool_availability_distinguishes_no_tools_from_unused_tools():
 def root_metadata(exporter, key):
     root = next(s for s in exporter.get_finished_spans() if s.attributes.get(AS_ROOT))
     value = root.attributes[f"langfuse.observation.metadata.{key}"]
-    # Langfuse gives each top-level metadata key its own attribute; scalars stay
-    # scalars, nested dicts arrive JSON-encoded.
-    return json.loads(value) if isinstance(value, str) else value
+    # Langfuse gives each top-level metadata key its own attribute: numbers and bools
+    # stay scalars, strings stay strings, nested dicts arrive JSON-encoded.
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
 
 
 def test_tool_counts_are_recorded_for_a_turn_that_used_builtin_tools():
@@ -622,6 +627,129 @@ def task_inlet_body(task="title_generation"):
     body = inlet_body()
     body["metadata"] = {**body["metadata"], "task": task}
     return body
+
+
+def task_inlet_body_real_shape(task="title_generation"):
+    """The payload Open WebUI actually hands the filter for a background task.
+
+    `routers/tasks.py` builds it as `{"model": task_model_id, "messages": [...],
+    "metadata": {**request.state.metadata, "task": ..., "task_body": form_data}}`, and
+    `generate_chat_completion` merges `request.state.metadata` over it a second time.
+    That metadata belongs to the *chat*: its `model` is the chat's model record, and
+    its tool_ids / features / params describe the conversation, not the task call. The
+    task's own model reaches the filter only as the top-level `body["model"]`.
+    """
+    return {
+        "model": "gemini-2.0-flash",  # task.model.external
+        "stream": False,
+        "max_completion_tokens": 1000,
+        "messages": [
+            {"role": "user", "content": "### Task:\nGenerate a concise title..."}
+        ],
+        "metadata": {
+            "chat_id": CHAT_ID,
+            "message_id": MESSAGE_ID,
+            "session_id": "sess-1",
+            "task": task,
+            "tool_ids": ["weather"],
+            "features": {"web_search": True},
+            "params": {"function_calling": "native"},
+            "model": {
+                "id": "gpt-4o",
+                "name": "GPT-4o",
+                "info": {
+                    "params": {"system": "You are the chat assistant."},
+                    "meta": {"toolIds": ["calculator"]},
+                },
+            },
+            "task_body": {
+                "model": "gpt-4o",
+                "chat_id": CHAT_ID,
+                "messages": [
+                    {"role": "user", "content": "What is the weather in Pune?"},
+                    {"role": "assistant", "content": "It is 31C and clear in Pune."},
+                ],
+            },
+        },
+    }
+
+
+def test_task_trace_uses_the_task_model_not_the_chat_model():
+    """Regression: title/tags/follow-up traces were labelled with the chat's model.
+
+    Open WebUI merges the chat request's metadata into every task payload, so
+    `metadata["model"]` is the record for the model the *conversation* uses. The task
+    runs on `task.model.external`, which arrives only as `body["model"]` -- so reading
+    the record put the wrong model, its system prompt and its tools on the trace while
+    the request itself went to a different provider.
+    """
+    for use_name in (False, True):
+        pipeline, exporter = build_pipeline()
+        pipeline.valves.use_model_name_instead_of_id_for_generation = use_name
+        asyncio.run(pipeline.inlet(task_inlet_body_real_shape(), USER))
+        pipeline.langfuse.flush()
+
+        generation = next(
+            s for s in exporter.get_finished_spans() if s.name.startswith("llm:")
+        )
+        # Under `use_model_name...` the chat record's display name used to win outright.
+        assert generation.name == "llm:gemini-2.0-flash", use_name
+        assert (
+            generation.attributes["langfuse.observation.model.name"]
+            == "gemini-2.0-flash"
+        ), use_name
+
+        assert root_metadata(exporter, "model_id") == "gemini-2.0-flash"
+        assert root_metadata(exporter, "model_name") == "gemini-2.0-flash"
+        # The chat's model is still traced -- as the chat's, which is what it is.
+        assert root_metadata(exporter, "chat_model_id") == "gpt-4o"
+        assert root_metadata(exporter, "chat_model_name") == "GPT-4o"
+
+
+def test_task_trace_does_not_inherit_the_chat_prompt_or_tools():
+    pipeline, exporter = build_pipeline()
+    asyncio.run(pipeline.inlet(task_inlet_body_real_shape("tags_generation"), USER))
+    pipeline.langfuse.flush()
+
+    root = next(s for s in exporter.get_finished_spans() if s.attributes.get(AS_ROOT))
+    # The chat model's configured system prompt was never sent to the task model.
+    assert "langfuse.observation.metadata.system_prompt" not in root.attributes
+    generation = next(
+        s for s in exporter.get_finished_spans() if s.name.startswith("llm:")
+    )
+    input_messages = json.loads(generation.attributes["langfuse.observation.input"])
+    assert [m["role"] for m in input_messages] == ["user"]
+
+    # No tool is ever attached to a task payload; the tool_ids on it are the chat's.
+    availability = root_metadata(exporter, "tools_available")
+    assert availability["tool_ids"] == []
+    assert availability["model_tool_ids"] == []
+    assert availability["builtin_tools_active"] is False
+    assert availability["web_search"] is False
+    assert availability["any_tools_attached"] is False
+    assert root_metadata(exporter, "available_tool_count") == 0
+
+    # The triggering chat request is summarized, not copied in whole.
+    task_body = root_metadata(exporter, "task_body")
+    assert task_body == {
+        "chat_model_id": "gpt-4o",
+        "chat_id": CHAT_ID,
+        "message_count": 2,
+    }
+
+
+def test_chat_turn_still_uses_its_model_record():
+    """The guard must not throw away a record that does describe the request."""
+    pipeline, exporter = build_pipeline()
+    body = inlet_body()
+    body["metadata"]["model"] = {"id": "gpt-4o", "name": "GPT-4o"}
+    asyncio.run(pipeline.inlet(body, USER))
+    asyncio.run(pipeline.outlet(outlet_body(), USER))
+    pipeline.langfuse.flush()
+
+    assert root_metadata(exporter, "model_name") == "GPT-4o"
+    root = next(s for s in exporter.get_finished_spans() if s.attributes.get(AS_ROOT))
+    assert "langfuse.observation.metadata.chat_model_id" not in root.attributes
 
 
 def test_task_turn_does_not_evict_the_chat_turn():

@@ -481,6 +481,40 @@ class Pipeline:
         return params
 
     @staticmethod
+    def _resolve_model_record(
+        metadata: dict, model_id: Optional[str]
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Return ``(record, stale_record)``, keeping the record only if it fits.
+
+        Background tasks run on their own model -- `task.model.default` /
+        `task.model.external`, resolved by `get_task_model_id` -- which reaches the
+        filter *only* as the top-level ``body["model"]``. The metadata that travels
+        with them describes the chat, not the task: `routers/tasks.py` builds the task
+        payload as ``{**request.state.metadata, "task": ..., "task_body": ...}``, and
+        `generate_chat_completion` merges `request.state.metadata` over it a second
+        time (utils/chat.py). `request.state.metadata` is the *chat* request's
+        metadata (main.py), so ``metadata["model"]`` is the record for the model the
+        conversation uses.
+
+        Reading the model off that record therefore labelled every title, tag and
+        follow-up trace with the chat's model -- and dragged that model's system
+        prompt, tool ids and capabilities into the task trace with it -- while the
+        request itself went to a different provider entirely.
+
+        The record carries its own id, so this is checkable rather than a guess: if it
+        does not describe ``body["model"]``, it belongs to another request. It is
+        returned separately instead of being dropped, because for a task it identifies
+        the chat the task was fired for, which is worth tracing.
+        """
+        record = metadata.get("model")
+        if not isinstance(record, dict):
+            return {}, {}
+        record_id = record.get("id")
+        if record_id and model_id and str(record_id) != str(model_id):
+            return {}, record
+        return record, {}
+
+    @staticmethod
     def _render_variables(text: str, variables: Dict[str, Any]) -> str:
         """Substitute Open WebUI template variables into a system prompt.
 
@@ -501,7 +535,7 @@ class Pipeline:
 
     @classmethod
     def _resolve_system_prompt(
-        cls, body: dict, metadata: dict
+        cls, body: dict, metadata: dict, model_info: Dict[str, Any]
     ) -> Tuple[Optional[str], Optional[str]]:
         """Recover the system prompt, returning ``(prompt, source)``.
 
@@ -521,6 +555,11 @@ class Pipeline:
         Neither route sees text injected after the filter (memory context, skills,
         tool manifests, RAG context), so the result is the base prompt, not
         necessarily the full final one.
+
+        ``model_info`` must be the record `_resolve_model_record` validated against
+        ``body["model"]``: the record riding along on a background task belongs to the
+        chat, and rendering *its* system prompt into a title-generation trace would
+        show a prompt the task model was never sent.
         """
         for message in body.get("messages") or []:
             if isinstance(message, dict) and message.get("role") == "system":
@@ -528,7 +567,6 @@ class Pipeline:
                 if text:
                     return text, "messages"
 
-        model_info = metadata.get("model") if isinstance(metadata.get("model"), dict) else {}
         configured = ((model_info.get("info") or {}).get("params") or {}).get("system")
         if configured:
             variables = {
@@ -540,7 +578,9 @@ class Pipeline:
         return None, None
 
     @staticmethod
-    def _tool_availability(body: dict, metadata: dict) -> Dict[str, Any]:
+    def _tool_availability(
+        body: dict, metadata: dict, model_info: Dict[str, Any], is_task: bool = False
+    ) -> Dict[str, Any]:
         """Record which tools this request could actually reach, and how many.
 
         Open WebUI runs pipeline inlet filters *before* it resolves tools and injects
@@ -562,23 +602,31 @@ class Pipeline:
 
         ``outlet`` raises the floor with the tools the turn actually called, which is
         what keeps the count off zero for requests that only use builtin tools.
+
+        Background tasks get none of this. `routers/tasks.py` hand-builds their payload
+        -- model, messages, stream, max_tokens, metadata -- and they never go through
+        `process_chat_payload`, so no tool is resolved for them. But the chat request's
+        metadata rides along on that payload (see `_resolve_model_record`), so every
+        field read below would otherwise describe the conversation that triggered the
+        task rather than the task call itself.
         """
-        tool_ids = body.get("tool_ids") or metadata.get("tool_ids") or []
-        tool_servers = metadata.get("tool_servers") or []
-        payload_tools = body.get("tools") or []
-        features = metadata.get("features") or {}
-        params = metadata.get("params") or {}
+        tool_ids = [] if is_task else (body.get("tool_ids") or metadata.get("tool_ids") or [])
+        tool_servers = [] if is_task else (metadata.get("tool_servers") or [])
+        payload_tools = [] if is_task else (body.get("tools") or [])
+        features = {} if is_task else (metadata.get("features") or {})
+        params = {} if is_task else (metadata.get("params") or {})
 
         # Open WebUI also injects *builtin* tools (time, knowledge, memory, web
         # search, ...) that never appear anywhere in the inlet body. Mirror the
         # server's own gate from utils/middleware.py so the trace shows whether they
         # were in play. The `time` category (get_current_timestamp,
         # calculate_timestamp) is on by default and needs no feature flag.
-        model_meta = ((metadata.get("model") or {}).get("info") or {}).get("meta") or {}
+        model_meta = (model_info.get("info") or {}).get("meta") or {}
         capabilities = model_meta.get("capabilities") or {}
         builtin_tools_config = model_meta.get("builtinTools") or {}
         builtin_tools_active = bool(
-            metadata.get("session_id")
+            not is_task
+            and metadata.get("session_id")
             and params.get("function_calling") != "legacy"
             and capabilities.get("builtin_tools", True)
         )
@@ -640,6 +688,23 @@ class Pipeline:
                 or features.get("code_interpreter")
                 or features.get("web_search")
             ),
+        }
+
+    @staticmethod
+    def _summarize_task_body(task_body: dict) -> Dict[str, Any]:
+        """Compact ``metadata["task_body"]``, which is the whole triggering chat request.
+
+        `routers/tasks.py` attaches the chat's form data to every task payload, so
+        tracing it verbatim copies the entire conversation into each title, tag and
+        follow-up trace -- and its ``model`` key is the chat's model, one more place a
+        task looks like it ran on the wrong one. The transcript is already traced on
+        the chat turn; what is worth keeping here is which chat this task served.
+        """
+        messages = task_body.get("messages")
+        return {
+            "chat_model_id": task_body.get("model"),
+            "chat_id": task_body.get("chat_id"),
+            "message_count": len(messages) if isinstance(messages, list) else None,
         }
 
     @staticmethod
@@ -1025,8 +1090,11 @@ class Pipeline:
             self.log(f"Skipping task trace for task '{task_name}'")
             return body
 
-        model_info = metadata.get("model") if isinstance(metadata.get("model"), dict) else {}
         model_id = body.get("model")
+        # A background task runs on the task model, which reaches the filter only as
+        # body["model"]; the model record in its metadata describes the chat that
+        # triggered it. Keep the record only when it matches what is being called.
+        model_info, chat_model_info = self._resolve_model_record(metadata, model_id)
         model_name = model_info.get("name") or model_id
         model_value = (
             model_name
@@ -1063,8 +1131,10 @@ class Pipeline:
         user_message_obj = get_last_user_message_obj(messages)
         user_prompt = _content_to_text(user_message_obj.get("content"))
 
-        tools_available = self._tool_availability(body, metadata)
-        system_prompt, system_prompt_source = self._resolve_system_prompt(body, metadata)
+        tools_available = self._tool_availability(body, metadata, model_info, is_task)
+        system_prompt, system_prompt_source = self._resolve_system_prompt(
+            body, metadata, model_info
+        )
 
         # Show the model's configured system prompt in the traced messages. Open WebUI
         # strips it from the body before the filter runs, so without this the Langfuse
@@ -1078,7 +1148,7 @@ class Pipeline:
             generation_input = [{"role": "system", "content": system_prompt}, *messages]
 
         observation_metadata = {
-            **{k: v for k, v in metadata.items() if k != "model"},
+            **{k: v for k, v in metadata.items() if k not in ("model", "task_body")},
             "interface": "open-webui",
             "model_id": model_id,
             "model_name": model_name,
@@ -1092,6 +1162,16 @@ class Pipeline:
             "system_prompt": system_prompt,
             "system_prompt_source": system_prompt_source,
         }
+        if chat_model_info:
+            # Traced under its own name, the record that arrived with a task says which
+            # conversation the task served -- useful -- instead of standing in for the
+            # model the task actually ran on.
+            observation_metadata["chat_model_id"] = chat_model_info.get("id")
+            observation_metadata["chat_model_name"] = chat_model_info.get("name")
+        if isinstance(metadata.get("task_body"), dict):
+            observation_metadata["task_body"] = self._summarize_task_body(
+                metadata["task_body"]
+            )
 
         try:
             with propagate_attributes(**propagated):
