@@ -161,6 +161,11 @@ class Pipeline:
         # Flush synchronously at the end of every outlet. Turn off for throughput.
         flush_on_outlet: bool = True
 
+        # Compare the provider's reported input tokens against what the filter could
+        # actually see, and record the gap. This is the only way to size the context
+        # Open WebUI injects after the filter runs.
+        capture_input_reconciliation: bool = True
+
         # Safety net for turns that never reach outlet (cancelled/failed requests).
         open_turn_ttl_seconds: int = 1800
         max_open_turns: int = 2048
@@ -281,8 +286,19 @@ class Pipeline:
         return None
 
     @staticmethod
-    def _turn_key(chat_id: str, message_id: Optional[str]) -> str:
-        return f"{chat_id}:{message_id}" if message_id else chat_id
+    def _turn_key(chat_id: str, message_id: Optional[str], task_name: str = CHAT_TASK_NAME) -> str:
+        """Key an open turn.
+
+        ``task_name`` is part of the key because Open WebUI fires title, tag and
+        follow-up generation for the *same* chat_id and message_id as the chat turn
+        they describe. Without it those background calls collide with the chat turn:
+        the task's inlet evicts the chat turn as "superseded by a newer request",
+        and the chat's outlet then finalizes whichever task turn happens to hold the
+        key. ``trace_seed`` has always included the task name; this brings the
+        in-memory key in line with it.
+        """
+        base = f"{chat_id}:{message_id}" if message_id else chat_id
+        return f"{base}:{task_name}"
 
     @staticmethod
     def _resolve_chat_id(*containers: dict) -> str:
@@ -327,17 +343,45 @@ class Pipeline:
             self._abandon_turn(key, turn, "no outlet received before timeout")
 
     def _abandon_turn(self, turn_key: str, turn: Dict[str, Any], reason: str):
-        """Close an orphaned turn so Langfuse still receives the observations."""
+        """Close an orphaned turn so Langfuse still receives the observations.
+
+        Ends at the turn's *start*, not at sweep time. Calling ``end()`` with no
+        timestamp makes the SDK stamp "now", which for a turn evicted by the TTL is
+        at least ``open_turn_ttl_seconds`` after it opened -- so an abandoned turn
+        was being exported with a 30-, 70- or 90-minute duration it never had, and
+        those fabricated values dominate every latency percentile in the project.
+
+        The real elapsed time is still worth knowing, so it is recorded as metadata
+        (``abandoned_after_seconds``) where it describes the turn rather than
+        masquerading as model latency.
+        """
+        opened_at = turn.get("created_at") or time.time()
+        # OTel end timestamps are epoch nanoseconds.
+        end_time_ns = int(opened_at * 1e9)
+        abandoned_after = max(0.0, time.time() - opened_at)
+        abandon_metadata = {
+            "abandoned": True,
+            "abandoned_reason": reason,
+            "abandoned_after_seconds": round(abandoned_after, 3),
+            # Duration here is not measured; the turn never reported an end.
+            "latency_is_unknown": True,
+        }
         try:
             generation = turn.get("generation")
             if generation is not None:
-                generation.update(level="WARNING", status_message=reason)
-                generation.end()
+                generation.update(
+                    level="WARNING", status_message=reason, metadata=abandon_metadata
+                )
+                generation.end(end_time=end_time_ns)
             root = turn.get("root")
             if root is not None:
-                root.update(level="WARNING", status_message=reason)
-                root.end()
-            self.log(f"Closed abandoned turn {turn_key}: {reason}")
+                root.update(
+                    level="WARNING", status_message=reason, metadata=abandon_metadata
+                )
+                root.end(end_time=end_time_ns)
+            self.log(
+                f"Closed abandoned turn {turn_key} after {abandoned_after:.1f}s: {reason}"
+            )
         except Exception as e:
             self.log(f"Failed to close abandoned turn {turn_key}: {e}")
 
@@ -474,6 +518,82 @@ class Pipeline:
                 or features.get("web_search")
             ),
         }
+
+    @staticmethod
+    def _estimate_tokens(chars: int) -> int:
+        """Rough token count from a character count.
+
+        Deliberately crude -- roughly four characters per token, the usual English
+        rule of thumb. A real tokenizer would mean shipping tiktoken with the
+        pipeline for a number whose only job is to establish an order of magnitude:
+        the question this answers is "did the provider see ~30 tokens or ~5,000?",
+        and no plausible tokenizer error changes that answer.
+        """
+        return (chars + 3) // 4 if chars > 0 else 0
+
+    @classmethod
+    def _reconcile_input(
+        cls,
+        captured_messages: List[dict],
+        usage_details: Optional[Dict[str, int]],
+        tools_available: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Measure how much of the real prompt the filter never saw.
+
+        Open WebUI runs inlet filters *before* it resolves tools and assembles the
+        final prompt, and the outlet body carries no metadata, so this pipeline can
+        never observe the payload the model actually received -- see
+        ``_resolve_system_prompt`` and ``_tool_availability``. What it can do is
+        compare the two ends: the messages it captured at inlet, and the input-token
+        count the provider reports at outlet.
+
+        The difference is everything Open WebUI added in between (tool manifests,
+        memory, RAG context, its own templates). Reporting it as a number turns an
+        invisible discrepancy into one that can be tracked per request and
+        correlated with the feature flags already on the observation.
+        """
+        if not usage_details:
+            return None
+        reported = usage_details.get("input")
+        if not isinstance(reported, int) or reported <= 0:
+            return None
+
+        chars = 0
+        for message in captured_messages or []:
+            if not isinstance(message, dict):
+                continue
+            chars += len(_content_to_text(message.get("content")))
+        # A few tokens per message for role markers and chat-template scaffolding.
+        captured = cls._estimate_tokens(chars) + 4 * len(captured_messages or [])
+        hidden = reported - captured
+
+        reconciliation: Dict[str, Any] = {
+            "reported_input_tokens": reported,
+            "captured_input_tokens_estimated": captured,
+            "captured_messages": len(captured_messages or []),
+            "captured_chars": chars,
+            "hidden_input_tokens_estimated": hidden,
+            "hidden_share_estimated": round(hidden / reported, 4) if hidden > 0 else 0.0,
+            "estimation_method": "chars/4 + 4 per message",
+        }
+        # Only the flags that plausibly explain injected context, so the field reads
+        # as a shortlist of suspects rather than a copy of the whole tool summary.
+        if tools_available:
+            reconciliation["suspects"] = {
+                key: tools_available.get(key)
+                for key in (
+                    "any_tools_attached",
+                    "builtin_tools_active",
+                    "builtin_time_tools",
+                    "function_calling",
+                    "tool_ids",
+                    "tool_server_count",
+                    "code_interpreter",
+                    "web_search",
+                )
+                if tools_available.get(key)
+            }
+        return reconciliation
 
     @staticmethod
     def _extract_usage(assistant_message_obj: dict) -> Tuple[Optional[Dict[str, int]], Optional[Dict[str, float]]]:
@@ -843,7 +963,7 @@ class Pipeline:
             self.log(f"Failed to start trace for chat_id {chat_id}: {e}")
             return body
 
-        turn_key = self._turn_key(chat_id, message_id)
+        turn_key = self._turn_key(chat_id, message_id, task_name)
         turn = {
             "trace_id": trace_id,
             "root": root,
@@ -857,6 +977,10 @@ class Pipeline:
             "model_name": model_name,
             "user_id": user_id,
             "messages": messages,
+            # What the generation was told the input was, plus the tool flags, so
+            # outlet can reconcile against the provider's token count.
+            "generation_input": generation_input,
+            "tools_available": tools_available,
         }
 
         with self._lock:
@@ -883,7 +1007,9 @@ class Pipeline:
         metadata = body.get("metadata") or {}
         chat_id = self._resolve_chat_id(body, metadata)
         message_id = body.get("id") or metadata.get("message_id")
-        turn_key = self._turn_key(chat_id, message_id)
+        # Open WebUI only calls outlet for the user-visible chat turn; background
+        # task calls never reach here, so the chat task name is the right key.
+        turn_key = self._turn_key(chat_id, message_id, CHAT_TASK_NAME)
 
         turn = self._pop_turn(chat_id, turn_key)
         if turn is None:
@@ -900,6 +1026,20 @@ class Pipeline:
         completion_start_time = self._extract_completion_start_time(
             assistant_message_obj, turn.get("generation_started_at")
         )
+
+        reconciliation = None
+        if self.valves.capture_input_reconciliation:
+            reconciliation = self._reconcile_input(
+                turn.get("generation_input") or turn.get("messages") or [],
+                usage_details,
+                turn.get("tools_available"),
+            )
+            if reconciliation and reconciliation["hidden_input_tokens_estimated"] > 0:
+                self.log(
+                    f"{turn_key}: provider counted {reconciliation['reported_input_tokens']} "
+                    f"input tokens, filter saw ~{reconciliation['captured_input_tokens_estimated']} "
+                    f"({reconciliation['hidden_input_tokens_estimated']} injected after inlet)"
+                )
 
         error = assistant_message_obj.get("error") or body.get("error")
         level = "ERROR" if error else None
@@ -918,6 +1058,7 @@ class Pipeline:
                 completion_start_time=completion_start_time,
                 level=level,
                 status_message=status_message,
+                metadata={"input_reconciliation": reconciliation} if reconciliation else None,
             )
             generation.end()
 
@@ -958,6 +1099,12 @@ class Pipeline:
             self.log(f"Completed trace {turn['trace_id']} for turn {turn_key}")
         except Exception as e:
             self.log(f"Failed to finalize trace for {turn_key}: {e}")
+
+        # Sweep here as well as in inlet. Sweeping only on inlet means a turn that
+        # never completes stays open until the *next* request arrives, so on an idle
+        # instance it sat for as long as the gap in traffic -- which is how single
+        # observations ended up more than an hour long.
+        self._sweep_open_turns()
 
         if self.valves.flush_on_outlet:
             try:

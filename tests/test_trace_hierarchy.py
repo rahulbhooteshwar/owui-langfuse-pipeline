@@ -12,6 +12,7 @@ import itertools
 import json
 import os
 import sys
+import time
 
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
@@ -514,6 +515,119 @@ def test_module_loads_the_way_the_pipelines_server_loads_it():
     pipeline = module.Pipeline()
     assert pipeline.type == "filter"
     assert pipeline.valves.pipelines == ["*"]
+
+
+def task_inlet_body(task="title_generation"):
+    """A background task call. Open WebUI reuses the chat's chat_id and message_id."""
+    body = inlet_body()
+    body["metadata"] = {**body["metadata"], "task": task}
+    return body
+
+
+def test_task_turn_does_not_evict_the_chat_turn():
+    # Open WebUI fires title/tag/follow-up generation against the same chat_id and
+    # message_id as the chat turn. When the turn key ignored the task name they
+    # collided, and the chat turn was closed as "superseded by a newer request".
+    pipeline, exporter = build_pipeline()
+    asyncio.run(pipeline.inlet(inlet_body(), USER))
+    asyncio.run(pipeline.inlet(task_inlet_body(), USER))
+
+    keys = list(pipeline._turns.keys())
+    assert len(keys) == 2, f"chat and task turns shared a key: {keys}"
+
+    asyncio.run(pipeline.outlet(outlet_body(), USER))
+    pipeline.langfuse.flush()
+
+    spans = exporter.get_finished_spans()
+    chat_roots = [s for s in spans if s.name == "open-webui:chat"]
+    assert len(chat_roots) == 1
+    # The chat turn completed normally, so it must not carry the abandon marker.
+    assert chat_roots[0].attributes.get("langfuse.observation.level") != "WARNING"
+
+
+def test_abandoned_turn_ends_at_turn_start_not_sweep_time():
+    # end() with no timestamp stamps "now". For a turn evicted by the TTL that is at
+    # least open_turn_ttl_seconds after it opened, so abandoned turns were exported
+    # with 30-, 70- or 90-minute durations they never had -- values that then
+    # dominate every latency percentile in the project.
+    pipeline, exporter = build_pipeline()
+    asyncio.run(pipeline.inlet(inlet_body(), USER))
+
+    turn_key, turn = next(iter(pipeline._turns.items()))
+    turn["created_at"] -= 3600  # as the TTL sweep would find it an hour later
+    expected_end_ns = int(turn["created_at"] * 1e9)
+    pipeline._turns.pop(turn_key)
+
+    swept_at = time.time()
+    pipeline._abandon_turn(turn_key, turn, "no outlet received before timeout")
+    pipeline.langfuse.flush()
+
+    root = [s for s in exporter.get_finished_spans() if s.name == "open-webui:chat"][0]
+    assert root.end_time == expected_end_ns, "span did not end at the turn's start"
+    # The point of the fix: the end time is the turn's start, not the sweep.
+    assert (swept_at * 1e9) - root.end_time > 3500 * 1e9
+
+    assert root.attributes["langfuse.observation.level"] == "WARNING"
+    assert root.attributes["langfuse.observation.metadata.abandoned"] is True
+    # The hour is still recorded -- as a property of the turn, not as latency.
+    elapsed = float(root.attributes["langfuse.observation.metadata.abandoned_after_seconds"])
+    assert elapsed >= 3600
+
+
+def test_outlet_sweeps_stale_turns():
+    # Sweeping only on inlet left orphaned turns open until the next request, so an
+    # idle instance held them for however long the traffic gap lasted.
+    pipeline, exporter = build_pipeline()
+    pipeline.valves.open_turn_ttl_seconds = 1
+
+    asyncio.run(pipeline.inlet(task_inlet_body("tags_generation"), USER))
+    stale_key = next(iter(pipeline._turns))
+    pipeline._turns[stale_key]["created_at"] -= 10
+
+    asyncio.run(pipeline.inlet(inlet_body(), USER))
+    asyncio.run(pipeline.outlet(outlet_body(), USER))
+    pipeline.langfuse.flush()
+
+    assert stale_key not in pipeline._turns
+    names = {s.name for s in exporter.get_finished_spans()}
+    assert "open-webui:tags_generation" in names
+
+
+def test_reconciliation_reports_context_injected_after_inlet():
+    # The filter cannot see the payload Open WebUI finally sends, so the only way to
+    # size that hidden context is to diff the provider's token count against what
+    # the filter did capture.
+    pipeline, exporter = build_pipeline()
+    asyncio.run(pipeline.inlet(inlet_body(), USER))
+
+    body = outlet_body()
+    # Provider reports far more input than the ~10 tokens the filter saw.
+    body["messages"][-1]["usage"] = {"prompt_tokens": 5181, "completion_tokens": 85}
+    asyncio.run(pipeline.outlet(body, USER))
+    pipeline.langfuse.flush()
+
+    generation = [s for s in exporter.get_finished_spans() if s.name.startswith("llm:")][0]
+    # Nested metadata is serialized as one JSON attribute, not flattened per key.
+    report = json.loads(
+        generation.attributes["langfuse.observation.metadata.input_reconciliation"]
+    )
+    assert report["reported_input_tokens"] == 5181
+    assert report["hidden_input_tokens_estimated"] > 5000, report
+    assert report["hidden_share_estimated"] > 0.9
+    # The flags that could explain the injected context travel with the number.
+    assert report["suspects"]["builtin_tools_active"] is True
+
+
+def test_reconciliation_absent_when_provider_reports_no_usage():
+    pipeline, exporter = build_pipeline()
+    asyncio.run(pipeline.inlet(inlet_body(), USER))
+    body = outlet_body()
+    body["messages"][-1].pop("usage", None)
+    asyncio.run(pipeline.outlet(body, USER))
+    pipeline.langfuse.flush()
+
+    generation = [s for s in exporter.get_finished_spans() if s.name.startswith("llm:")][0]
+    assert not [k for k in generation.attributes if "input_reconciliation" in k]
 
 
 def test_outlet_without_inlet_does_not_crash():
