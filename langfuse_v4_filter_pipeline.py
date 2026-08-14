@@ -67,6 +67,44 @@ MODEL_PARAMETER_KEYS = (
 
 MAX_PROPAGATED_VALUE_LENGTH = 200
 
+# Open WebUI's builtin `time` tool category. These are injected server-side for any
+# non-legacy request and never appear anywhere in the inlet body, so the only way to
+# count them is to name them here. Taken from utils/middleware.py and confirmed by
+# traces where `calculate_timestamp` was called with no `tool_ids` on the request.
+BUILTIN_TIME_TOOL_NAMES = ("get_current_timestamp", "calculate_timestamp")
+
+
+def _spec_tool_names(specs: Any) -> List[str]:
+    """Pull function names out of tool specs.
+
+    Handles both shapes Open WebUI passes around: OpenAI's
+    ``{"type": "function", "function": {"name": ...}}`` used for ``body["tools"]``,
+    and the bare ``{"name": ..., "parameters": ...}`` entries that
+    ``get_tool_servers_data`` puts in each tool server's ``specs``.
+    """
+    names: List[str] = []
+    for spec in specs or []:
+        if not isinstance(spec, dict):
+            continue
+        function = spec.get("function")
+        name = function.get("name") if isinstance(function, dict) else None
+        name = name or spec.get("name")
+        if name:
+            names.append(str(name))
+    return names
+
+
+def _dedupe(names: Any) -> List[str]:
+    """Order-preserving de-duplication of tool names."""
+    seen = set()
+    unique: List[str] = []
+    for name in names or []:
+        text = str(name)
+        if text and text not in seen:
+            seen.add(text)
+            unique.append(text)
+    return unique
+
 
 def _content_to_text(content: Any) -> str:
     """Flatten Open WebUI message content (string or multi-part list) to text."""
@@ -342,6 +380,46 @@ class Pipeline:
         for key, turn in expired:
             self._abandon_turn(key, turn, "no outlet received before timeout")
 
+    def _close_task_turn(self, task_name: str, trace_id: str, root, generation):
+        """Export a background-task trace at inlet, because outlet never comes.
+
+        Open WebUI calls the outlet filter only for the user-visible chat turn. Title,
+        tags, follow-up, query and autocomplete generation go through
+        `generate_chat_completion`, whose response is returned straight to the caller
+        (utils/chat.py), so the inlet filter is the only half of the request this
+        pipeline ever sees.
+
+        Held open waiting for that outlet, a task trace reached Langfuse only when the
+        TTL sweep or a clean shutdown got to it -- up to ``open_turn_ttl_seconds``
+        late, flagged ``WARNING`` / ``abandoned``, and lost outright if the pipelines
+        container was killed before either ran. That is why task traces showed up
+        erratically: nothing was wrong with the trace, it was queued behind an event
+        that does not exist.
+
+        Closing here gives up a latency measurement the filter never had for a task
+        anyway, and gets a trace that is always exported, exported immediately, and
+        not mislabelled as a failure.
+        """
+        task_metadata = {
+            # Not an error: the response, its token usage and its latency are on the
+            # other side of a filter hook Open WebUI does not call for tasks.
+            "closed_at_inlet": True,
+            "outlet_not_called_by_design": True,
+            "output_unavailable": True,
+            "usage_unavailable": True,
+            "latency_is_unknown": True,
+        }
+        try:
+            if generation is not None:
+                generation.update(metadata=task_metadata)
+                generation.end()
+            if root is not None:
+                root.update(metadata=task_metadata)
+                root.end()
+            self.log(f"Exported task trace {trace_id} for '{task_name}' at inlet")
+        except Exception as e:
+            self.log(f"Failed to close task trace for '{task_name}': {e}")
+
     def _abandon_turn(self, turn_key: str, turn: Dict[str, Any], reason: str):
         """Close an orphaned turn so Langfuse still receives the observations.
 
@@ -463,7 +541,7 @@ class Pipeline:
 
     @staticmethod
     def _tool_availability(body: dict, metadata: dict) -> Dict[str, Any]:
-        """Record which tools this request could actually reach.
+        """Record which tools this request could actually reach, and how many.
 
         Open WebUI runs pipeline inlet filters *before* it resolves tools and injects
         their specs into the payload (utils/middleware.py: the inlet filter runs at
@@ -474,6 +552,16 @@ class Pipeline:
         These fields can, and they separate "the model chose not to call a tool" from
         "no tool was ever attached to the request". Note `tool_ids` still sits at the
         top level of the body at inlet time; it is moved into metadata later.
+
+        ``available_tool_count`` is deliberately a *floor*, for two reasons:
+
+        * a `tool_ids` entry names a tool *module*, which `get_tools` expands into one
+          spec per callable function -- an expansion that happens after this runs;
+        * anything Open WebUI attaches later (`body["tools"]`, builtin categories
+          other than `time`) is invisible here.
+
+        ``outlet`` raises the floor with the tools the turn actually called, which is
+        what keeps the count off zero for requests that only use builtin tools.
         """
         tool_ids = body.get("tool_ids") or metadata.get("tool_ids") or []
         tool_servers = metadata.get("tool_servers") or []
@@ -494,30 +582,118 @@ class Pipeline:
             and params.get("function_calling") != "legacy"
             and capabilities.get("builtin_tools", True)
         )
+        builtin_time_tools = builtin_tools_active and bool(
+            builtin_tools_config.get("time", True)
+        )
+
+        # Tools bound to the model record rather than picked per request. The chat UI
+        # merges these into `tool_ids` before sending, but a direct API call does not,
+        # and Open WebUI attaches them server-side either way.
+        model_tool_ids = model_meta.get("toolIds") or []
+        payload_tool_names = _spec_tool_names(payload_tools)
+        # A tool server exposes N functions, so the number of *servers* is not the
+        # number of tools; each server carries its own spec list.
+        tool_server_tools: List[str] = []
+        for server in tool_servers:
+            if isinstance(server, dict):
+                tool_server_tools.extend(_spec_tool_names(server.get("specs")))
+        builtin_tool_names = list(BUILTIN_TIME_TOOL_NAMES) if builtin_time_tools else []
+
+        available = _dedupe(
+            [
+                *tool_ids,
+                *model_tool_ids,
+                *payload_tool_names,
+                *tool_server_tools,
+                *builtin_tool_names,
+            ]
+        )
 
         return {
             "tool_ids": tool_ids,
+            "model_tool_ids": model_tool_ids,
             "tool_server_count": len(tool_servers),
-            "payload_tools": [
-                (tool.get("function") or {}).get("name")
-                for tool in payload_tools
-                if isinstance(tool, dict)
-            ],
+            "payload_tools": payload_tool_names,
             "code_interpreter": bool(features.get("code_interpreter")),
             "web_search": bool(features.get("web_search")),
             "function_calling": params.get("function_calling"),
             "builtin_tools_active": builtin_tools_active,
-            "builtin_time_tools": builtin_tools_active
-            and bool(builtin_tools_config.get("time", True)),
+            "builtin_time_tools": builtin_time_tools,
+            "available_tool_names": available,
+            "available_tool_count": len(available),
+            # See the docstring: tool modules expand server-side and late-attached
+            # tools are invisible, so this counts what is provably reachable.
+            "available_tool_count_is_lower_bound": True,
+            "available_tool_sources": {
+                "tool_ids": len(tool_ids),
+                "model_tool_ids": len(model_tool_ids),
+                "payload_tools": len(payload_tool_names),
+                "tool_servers": len(tool_server_tools),
+                "builtin": len(builtin_tool_names),
+            },
             "any_tools_attached": bool(
                 tool_ids
                 or tool_servers
                 or payload_tools
+                or model_tool_ids
                 or builtin_tools_active
                 or features.get("code_interpreter")
                 or features.get("web_search")
             ),
         }
+
+    @staticmethod
+    def _summarize_tool_calls(tool_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Turn the reconstructed calls into the counts the trace should carry.
+
+        The `tool` observations already show *which* tools ran, but nothing recorded
+        *how many*, so there was no number to aggregate on, filter by, or chart -- the
+        one thing a metadata field is for.
+        """
+        calls_by_name: Dict[str, int] = {}
+        sources = set()
+        for call in tool_calls or []:
+            name = str(call.get("name") or "tool")
+            calls_by_name[name] = calls_by_name.get(name, 0) + 1
+            source = (call.get("metadata") or {}).get("source")
+            if source:
+                sources.add(str(source))
+
+        return {
+            "count": len(tool_calls or []),
+            "unique_count": len(calls_by_name),
+            "names": sorted(calls_by_name),
+            "calls_by_name": calls_by_name,
+            "source": next(iter(sorted(sources)), None),
+        }
+
+    @staticmethod
+    def _reconcile_tool_availability(
+        availability: Optional[Dict[str, Any]], tool_calls: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Fold the tools that actually ran back into the availability block.
+
+        The inlet count is a floor (see ``_tool_availability``) and for a request whose
+        tools are all resolved after the filter -- builtin tools, tool modules that
+        expand into several functions -- that floor is zero even though the model had
+        tools and used them. A tool that was called was, by definition, available, so
+        outlet raises the floor by the calls the turn actually made.
+        """
+        reconciled = dict(availability or {})
+        known = _dedupe(reconciled.get("available_tool_names"))
+        observed = [name for name in tool_calls.get("names") or [] if name not in known]
+
+        if observed:
+            sources = dict(reconciled.get("available_tool_sources") or {})
+            sources["observed_calls"] = len(observed)
+            reconciled["available_tool_sources"] = sources
+            known.extend(observed)
+
+        reconciled["available_tool_names"] = known
+        reconciled["available_tool_count"] = len(known)
+        if tool_calls.get("count"):
+            reconciled["any_tools_attached"] = True
+        return reconciled
 
     @staticmethod
     def _estimate_tokens(chars: int) -> int:
@@ -583,6 +759,7 @@ class Pipeline:
                 key: tools_available.get(key)
                 for key in (
                     "any_tools_attached",
+                    "available_tool_count",
                     "builtin_tools_active",
                     "builtin_time_tools",
                     "function_calling",
@@ -907,6 +1084,11 @@ class Pipeline:
             "model_name": model_name,
             "user_id": user_id,
             "tools_available": tools_available,
+            # Also promoted to a top-level key: Langfuse turns each top-level metadata
+            # key into its own attribute, so this one is filterable and chartable,
+            # while nested keys are only readable inside the JSON blob. Outlet
+            # overwrites it once the tools that actually ran are known.
+            "available_tool_count": tools_available["available_tool_count"],
             "system_prompt": system_prompt,
             "system_prompt_source": system_prompt_source,
         }
@@ -961,6 +1143,12 @@ class Pipeline:
                 )
         except Exception as e:
             self.log(f"Failed to start trace for chat_id {chat_id}: {e}")
+            return body
+
+        if is_task:
+            # Background tasks never reach outlet, so there is nothing to wait for.
+            self._close_task_turn(task_name, trace_id, root, generation)
+            self._sweep_open_turns()
             return body
 
         turn_key = self._turn_key(chat_id, message_id, task_name)
@@ -1027,12 +1215,21 @@ class Pipeline:
             assistant_message_obj, turn.get("generation_started_at")
         )
 
+        # Extracted unconditionally: `capture_tool_calls` gates the per-call `tool`
+        # observations, not the counts. Turning the observations off should not blank
+        # out how many tools ran.
+        tool_calls = self._extract_tool_calls(messages)
+        tool_call_summary = self._summarize_tool_calls(tool_calls)
+        tools_available = self._reconcile_tool_availability(
+            turn.get("tools_available"), tool_call_summary
+        )
+
         reconciliation = None
         if self.valves.capture_input_reconciliation:
             reconciliation = self._reconcile_input(
                 turn.get("generation_input") or turn.get("messages") or [],
                 usage_details,
-                turn.get("tools_available"),
+                tools_available,
             )
             if reconciliation and reconciliation["hidden_input_tokens_estimated"] > 0:
                 self.log(
@@ -1064,7 +1261,7 @@ class Pipeline:
 
             with propagate_attributes(**turn["propagated"]):
                 if self.valves.capture_tool_calls:
-                    for call in self._extract_tool_calls(messages):
+                    for call in tool_calls:
                         tool_span = root.start_observation(
                             name=f"tool:{call['name']}",
                             as_type="tool",
@@ -1089,6 +1286,16 @@ class Pipeline:
                 output=assistant_message,
                 level=level,
                 status_message=status_message,
+                # Metadata keys merge across updates, so this adds the tool counts and
+                # replaces the inlet availability block without touching the rest of
+                # what inlet wrote. Both counts are also promoted to top-level keys so
+                # they are filterable in Langfuse rather than buried in a JSON blob.
+                metadata={
+                    "tools_available": tools_available,
+                    "available_tool_count": tools_available["available_tool_count"],
+                    "tool_calls": tool_call_summary,
+                    "tool_call_count": tool_call_summary["count"],
+                },
             )
             if self.valves.set_trace_io:
                 with warnings.catch_warnings():
